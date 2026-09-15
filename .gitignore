@@ -189,3 +189,11 @@ uploadFile
 videoFile
 
 /uploader/bilibili_uploader/qrcode.png
+
+# 本地修复备份和私有运行数据不得进入 fork。
+*.py.before-arc-home
+*.py.pre-*
+/logs/
+/tmp/
+/.social-auto-upload/
+/verify_code.txt

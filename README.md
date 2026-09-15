@@ -1,5 +1,11 @@
 # social-auto-upload
 
+本 fork 由 [huixiangyang](https://github.com/huixiangyang/social-auto-upload) 维护，作为 Arc Home 视频分发工作台的上传引擎。部署分支为 `arc-home`，以 X1 已验证的上游提交 `1c66b7d` 为基础，纳入服务器原有修复。
+
+账号管理、发布前预览和实时执行日志在 Arc Home 中提供。配置、部署和回滚见 [Arc Home 接入说明](docs/arc-home.md)。
+
+以下为上游项目说明。
+
 `social-auto-upload` 是一个强大的自动化工具，旨在帮助内容创作者和运营者高效地将视频内容一键发布到多个国内外主流社交媒体平台。
 项目实现了对 `抖音`、`Bilibili`、`小红书`、`快手`、`视频号`、`百家号`、`支付宝生活号`、`微博`、`虎扑`、`TikTok` 以及 `YouTube` 等平台的视频上传、定时发布等功能。
 结合各平台 `uploader` 模块，您可以轻松配置和扩展支持的平台，并通过示例脚本快速上手。
