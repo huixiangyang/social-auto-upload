@@ -1163,6 +1163,10 @@ class TencentVideo(TencentBaseUploader):
             raise ValueError("视频模式下，title 是必须的")
         self.file_path = str(self.validate_video_file(self.file_path))
         media_info = await _probe_tencent_media(self.file_path)
+        # 平台码率适配只生成上传副本，原成片和发布冻结摘要不变。
+        if float((media_info.get("format") or {}).get("bit_rate") or 0) > TENCENT_MAX_TOTAL_BITRATE:
+            from uploader.tencent_uploader.delivery import prepare_upload_file
+            self.file_path, media_info = await prepare_upload_file(self.file_path, media_info)
         _validate_tencent_media_info(media_info, self.file_path)
         if self.thumbnail_landscape_path:
             self.thumbnail_landscape_path = str(self.validate_image_file(self.thumbnail_landscape_path))

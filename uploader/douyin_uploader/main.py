@@ -1117,6 +1117,7 @@ class DouYinVideo(DouYinBaseUploader):
         # Arc Home: only one publish click per attempt
         # 单次任务最多点击一次发布，结果不明时交给工作台核对，防止重复投稿。
         publish_clicked = False
+        publish_error_captured = False
         publish_deadline = asyncio.get_running_loop().time() + 180
         while True:
             if asyncio.get_running_loop().time() > publish_deadline:
@@ -1155,15 +1156,27 @@ class DouYinVideo(DouYinBaseUploader):
                 # ── 正常发布流程 ──
                 publish_button = page.get_by_role("button", name="发布", exact=True)
                 if not publish_clicked and await publish_button.count():
+                    # 先确认按钮可点击；遮罩或禁用状态不能消耗唯一一次提交机会。
+                    await self.handle_auto_video_cover(page)
+                    await publish_button.click(trial=True, timeout=10000)
                     publish_clicked = True
-                    await publish_button.click(force=True)
+                    await publish_button.click()
                 await page.wait_for_url(
                     "https://creator.douyin.com/creator-micro/content/manage**",
                     timeout=3000,
                 )
                 douyin_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
                 break
-            except Exception:
+            except Exception as exc:
+                if not publish_error_captured:
+                    publish_error_captured = True
+                    # 保存当前投稿页证据，不保存身份 Cookie，便于核对未跳转的原因。
+                    diagnostic = Path(BASE_DIR) / "cache" / "douyin-publish-diagnostics"
+                    diagnostic.mkdir(parents=True, exist_ok=True)
+                    stem = Path(self.file_path).stem
+                    (diagnostic / (stem + ".txt")).write_text(await page.locator("body").inner_text())
+                    await page.screenshot(path=str(diagnostic / (stem + ".png")), full_page=True)
+                    douyin_logger.warning("发布未跳转，已保存页面诊断，错误类型：" + type(exc).__name__)
                 await self.handle_auto_video_cover(page)
                 douyin_logger.info(_msg("🏃", "小人正在冲刺发布视频"))
                 if self.debug:
