@@ -6,10 +6,12 @@ import base64
 import inspect
 import json
 import os
+import re
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from patchright.async_api import Page
 from patchright.async_api import Playwright
@@ -28,6 +30,10 @@ TENCENT_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 TENCENT_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
 TENCENT_MAX_TOTAL_BITRATE = 10_000_000
 TENCENT_MIN_VIDEO_DURATION = 3.0
+
+
+class TencentUploadStalledError(RuntimeError):
+    """仅在点击发表之前、可见传输百分比长期不变时允许重建上传会话。"""
 
 
 def _msg(emoji: str, text: str) -> str:
@@ -909,77 +915,77 @@ class TencentBaseUploader(BaseVideoUploader):
             raise RuntimeError("原创开关未保持勾选")
         tencent_logger.success("已在首次发表前声明原创")
 
+    async def save_upload_diagnostic(self, page: Page, state: dict) -> None:
+        # 放在运行用户的 TMPDIR，不随发布器清理本次私有 Cookie 副本而消失。
+        directory = Path(tempfile.mkdtemp(prefix="tencent-upload-"))
+        state = {**state, "request_failures": getattr(self, "upload_request_failures", [])}
+        (directory / "state.json").write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            await page.screenshot(path=str(directory / "form.png"), full_page=True, timeout=10000)
+        except Exception as exc:
+            tencent_logger.warning(f"上传现场截图失败：{type(exc).__name__}")
+        tencent_logger.warning(f"上传现场已保存：{directory}")
+
     async def wait_for_upload_complete(
-        self, page: Page, timeout_seconds: int = 3600, max_retries: int = 3
+        self, page: Page, timeout_seconds: int = 3600, max_retries: int = 3,
+        stall_timeout_seconds: float = 300,
     ) -> None:
-        """等上传完成。
-
-        **必须有个头，而且重试必须有上限。** 原来是没有出口的 while True：上传出错就
-        删掉重传，失败再删再传，永远循环；中间每 2 秒打一行「正在上传视频中...」——
-        这条日志和真的在传一模一样，从外面完全分不出。
-
-        实测（2026-08-11，172MB / 上行 ~0.5Mbps）：每次传到 4 分钟左右报错，然后重来，
-        整整循环了近 2 小时也不会停，进程也不会退。用户看到的只有「正在上传视频中」，
-        真相是同一段视频被反复上传了 20 多次。
-
-        默认 1 小时 / 3 次重试：慢网络上大文件确实会传很久，上限要给够；
-        但到点、或者重试用完，就带现场截图明确报错，不要静默地转下去。
-        """
-        deadline = time.monotonic() + timeout_seconds
+        """分别观察文件传输和表单就绪；进度停滞只触发发表前的有限恢复。"""
+        started = time.monotonic()
+        deadline = started + timeout_seconds
         last_report = 0.0
+        last_progress_at = started
+        best_progress = None
         retries = 0
+        diagnostic_saved = False
         while True:
-            if time.monotonic() > deadline:
-                try:
-                    shot = Path(BASE_DIR) / "debug_tencent_upload_timeout.png"
-                    await page.screenshot(path=str(shot), full_page=True)
-                    tencent_logger.error(_msg("📸", f"上传超时现场已截图 {shot}"))
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    f"视频号上传超过 {timeout_seconds} 秒仍未完成（「发表」按钮一直不可用）"
-                )
-            try:
-                publish_button = page.locator('div.form-btns button:has-text("发表"):visible').first
-                if await publish_button.count():
-                    button_class = await publish_button.get_attribute("class")
-                    if (
-                        not await publish_button.is_disabled()
-                        and (not button_class or "weui-desktop-btn_disabled" not in button_class)
-                    ):
-                        tencent_logger.info(_msg("🥳", "视频上传完毕"))
-                        break
-
-                # 每 2 秒刷一行同样的话没有信息量，只是把日志冲爆（实测 50 分钟刷了 1600 行）。
-                # 30 秒一行，并且带上已等多久——「还要多久」是这里唯一有用的信息。
-                now = time.monotonic()
-                if now - last_report >= 30:
-                    waited = int(timeout_seconds - (deadline - now))
-                    tencent_logger.info(_msg("🏃", f"正在上传视频中...（已等 {waited} 秒）"))
-                    last_report = now
-                await asyncio.sleep(2)
-
-                upload_failed = await page.locator("div.status-msg.error").count()
-                delete_button = await page.locator('div.media-status-content div.tag-inner:has-text("删除")').count()
-                if upload_failed and delete_button:
-                    retries += 1
-                    if retries > max_retries:
-                        try:
-                            shot = Path(BASE_DIR) / "debug_tencent_upload_failed.png"
-                            await page.screenshot(path=str(shot), full_page=True)
-                            tencent_logger.error(_msg("📸", f"上传反复失败，现场已截图 {shot}"))
-                        except Exception:
-                            pass
-                        raise RuntimeError(
-                            f"视频号上传连续失败 {max_retries} 次，已停止重试"
-                            "（常见原因：文件过大、上行带宽太慢导致平台侧超时，或走了代理/VPN）"
-                        )
-                    tencent_logger.error(_msg("😵", f"发现上传出错了，准备重试（第 {retries}/{max_retries} 次）"))
-                    await self.handle_upload_error(page)
-            except RuntimeError:
-                raise
-            except Exception:
-                await asyncio.sleep(2)
+            now = time.monotonic()
+            status = await page.locator("div.media-status-content:visible, div.status-msg:visible").all_inner_texts()
+            progress_text = await page.locator("div.media-status-content .ant-progress-text:visible").all_inner_texts()
+            percentages = [float(text.strip().removesuffix("%")) for text in progress_text
+                           if re.fullmatch(r"\d+(?:\.\d+)?%", text.strip())]
+            progress = min(percentages) if percentages else None
+            if progress is not None and (best_progress is None or progress > best_progress):
+                best_progress, last_progress_at = progress, now
+                diagnostic_saved = False
+            publish_button = page.locator('div.form-btns button:has-text("发表"):visible').first
+            enabled = False
+            if await publish_button.count():
+                css = await publish_button.get_attribute("class") or ""
+                enabled = not await publish_button.is_disabled() and "weui-desktop-btn_disabled" not in css
+            if enabled:
+                tencent_logger.info("视频上传完成，发表表单已就绪")
+                return
+            errors = [text for text in await page.locator("div.status-msg.error:visible").all_inner_texts() if text.strip()]
+            state = {"elapsed_seconds": int(now - started), "progress_percent": progress,
+                     "unchanged_seconds": int(now - last_progress_at), "status": status,
+                     "errors": errors, "publish_enabled": enabled,
+                     "phase": "transferring" if progress is not None else "waiting_for_form"}
+            if now - last_report >= 30:
+                tencent_logger.info("上传状态：" + json.dumps(state, ensure_ascii=False))
+                last_report = now
+            # 外层发布器可能先超时；提前留存现场，不能等内部一小时超时才截图。
+            if now - last_progress_at >= min(120, stall_timeout_seconds) and not diagnostic_saved:
+                await self.save_upload_diagnostic(page, state)
+                diagnostic_saved = True
+            if now >= deadline:
+                await self.save_upload_diagnostic(page, state)
+                raise RuntimeError(f"视频号等待超过 {timeout_seconds} 秒，最后阶段 {state['phase']}，进度 {progress}")
+            if errors:
+                delete_button = page.locator('div.media-status-content div.tag-inner:has-text("删除")')
+                if not await delete_button.count() or retries >= max_retries:
+                    await self.save_upload_diagnostic(page, state)
+                    raise RuntimeError("视频号上传失败：" + "；".join(errors))
+                retries += 1
+                tencent_logger.warning(f"平台明确报告上传失败，重传媒体 {retries}/{max_retries}")
+                await self.handle_upload_error(page)
+                best_progress, last_progress_at = None, time.monotonic()
+                diagnostic_saved = False
+            elif progress is not None and now - last_progress_at >= stall_timeout_seconds:
+                # 没有可见百分比时可能是表单校验，绝不当作传输故障自动重传。
+                await self.save_upload_diagnostic(page, state)
+                raise TencentUploadStalledError(f"传输进度 {progress:g}% 已连续 {stall_timeout_seconds:g} 秒不变，尚未点击发表")
+            await asyncio.sleep(2)
 
     async def submit_publish(self, page: Page) -> None:
         is_draft = getattr(self, "is_draft", False)
@@ -1376,33 +1382,48 @@ class TencentVideo(TencentBaseUploader):
         await self.validate_upload_args()
         tencent_logger.info(_msg("🥳", "上传前检查通过"))
 
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=self.headless))
-        context = await browser.new_context(storage_state=self.account_file)
+        # 只恢复上传阶段；封面、排期和提交阶段的异常一律交给调用方核对，不能重投。
+        for media_attempt in range(2):
+            browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=self.headless))
+            context = await browser.new_context(storage_state=self.account_file)
+            try:
+                page = await context.new_page()
+                self.upload_request_failures = []
 
-        try:
-            page = await context.new_page()
-            await self.open_upload_page(page)
-            tencent_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}"))
+                def record_failure(request):
+                    if request.method not in {"POST", "PUT"} or request.resource_type not in {"xhr", "fetch"}:
+                        return
+                    # 不记录含签名的 URL、请求体或 Cookie。
+                    entry = {"host": urlsplit(request.url).hostname, "method": request.method,
+                             "error": request.failure}
+                    self.upload_request_failures = (self.upload_request_failures + [entry])[-20:]
+                    tencent_logger.warning("上传请求失败：" + json.dumps(entry, ensure_ascii=False))
 
-            await self.upload_video_file(page, self.file_path)
-            await self.prepare_video_for_publish(page)
-            await self.wait_for_upload_complete(page)
-            # 上传完成、表单稳定后再选合集（否则上传中选的会被重置）
-            await self.apply_collection(page)
-            await self.apply_original_statement(page)
-            await self.set_thumbnail(page)
-
-            if self.publish_strategy == TENCENT_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
-                await self.set_schedule_time_tencent(page, self.publish_date)
-
-            await self.set_short_title(page, self.title, self.short_title)
-            await self.submit_publish(page)
-
-            await context.storage_state(path=self.account_file)
-            tencent_logger.success(_msg("🥳", "cookie 更新完毕"))
-        finally:
-            await context.close()
-            await browser.close()
+                page.on("requestfailed", record_failure)
+                await self.open_upload_page(page)
+                tencent_logger.info(f"开始上传视频：{self.title}，媒体会话 {media_attempt + 1}/2")
+                await self.upload_video_file(page, self.file_path)
+                await self.prepare_video_for_publish(page)
+                try:
+                    await self.wait_for_upload_complete(page)
+                except TencentUploadStalledError:
+                    if media_attempt:
+                        raise
+                    tencent_logger.warning("传输停滞，关闭未提交页面后重建一次媒体会话；原内容和排期不变")
+                    continue
+                await self.apply_collection(page)
+                await self.apply_original_statement(page)
+                await self.set_thumbnail(page)
+                if self.publish_strategy == TENCENT_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
+                    await self.set_schedule_time_tencent(page, self.publish_date)
+                await self.set_short_title(page, self.title, self.short_title)
+                await self.submit_publish(page)
+                await context.storage_state(path=self.account_file)
+                tencent_logger.success("cookie 更新完毕")
+                return
+            finally:
+                await context.close()
+                await browser.close()
 
     async def tencent_upload_video(self):
         async with async_playwright() as playwright:
