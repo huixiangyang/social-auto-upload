@@ -33,7 +33,7 @@ TENCENT_MIN_VIDEO_DURATION = 3.0
 
 
 class TencentUploadStalledError(RuntimeError):
-    """仅在点击发表之前、可见传输百分比长期不变时允许重建上传会话。"""
+    """仅在点击发表之前、明确的上传状态长期无进展时允许重建会话。"""
 
 
 def _msg(emoji: str, text: str) -> str:
@@ -945,6 +945,11 @@ class TencentBaseUploader(BaseVideoUploader):
             percentages = [float(text.strip().removesuffix("%")) for text in progress_text
                            if re.fullmatch(r"\d+(?:\.\d+)?%", text.strip())]
             progress = min(percentages) if percentages else None
+            # 平台可能隐藏百分比但仍保留媒体区的“取消上传”；这仍是上传中，
+            # 不能误当成普通表单校验而绕过停滞看门狗。只检查媒体区的真实操作。
+            upload_active = progress is not None or bool(await page.locator(
+                'div.media-status-content div.tag-inner:visible'
+            ).filter(has_text=re.compile(r"^\s*取消上传\s*$")).count())
             if progress is not None and (best_progress is None or progress > best_progress):
                 best_progress, last_progress_at = progress, now
                 diagnostic_saved = False
@@ -958,9 +963,10 @@ class TencentBaseUploader(BaseVideoUploader):
                 return
             errors = [text for text in await page.locator("div.status-msg.error:visible").all_inner_texts() if text.strip()]
             state = {"elapsed_seconds": int(now - started), "progress_percent": progress,
+                     "last_progress_percent": best_progress, "upload_active": upload_active,
                      "unchanged_seconds": int(now - last_progress_at), "status": status,
                      "errors": errors, "publish_enabled": enabled,
-                     "phase": "transferring" if progress is not None else "waiting_for_form"}
+                     "phase": "transferring" if upload_active else "waiting_for_form"}
             if now - last_report >= 30:
                 tencent_logger.info("上传状态：" + json.dumps(state, ensure_ascii=False))
                 last_report = now
@@ -981,10 +987,11 @@ class TencentBaseUploader(BaseVideoUploader):
                 await self.handle_upload_error(page)
                 best_progress, last_progress_at = None, time.monotonic()
                 diagnostic_saved = False
-            elif progress is not None and now - last_progress_at >= stall_timeout_seconds:
-                # 没有可见百分比时可能是表单校验，绝不当作传输故障自动重传。
+            elif upload_active and now - last_progress_at >= stall_timeout_seconds:
+                # 没有百分比且媒体区也没有取消上传时，不因按钮禁用而重传。
                 await self.save_upload_diagnostic(page, state)
-                raise TencentUploadStalledError(f"传输进度 {progress:g}% 已连续 {stall_timeout_seconds:g} 秒不变，尚未点击发表")
+                detail = f"{progress:g}%" if progress is not None else "百分比不可见，媒体区仍可取消上传"
+                raise TencentUploadStalledError(f"上传状态 {detail} 已连续 {stall_timeout_seconds:g} 秒无进展，尚未点击发表")
             await asyncio.sleep(2)
 
     async def submit_publish(self, page: Page) -> None:

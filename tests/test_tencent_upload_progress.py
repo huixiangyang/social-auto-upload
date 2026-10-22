@@ -22,6 +22,24 @@ class UploadProgressTests(unittest.TestCase):
                 with self.assertRaises(TencentUploadStalledError):
                     await video.wait_for_upload_complete(page, timeout_seconds=5, stall_timeout_seconds=0.01)
                 self.assertEqual(video.save_upload_diagnostic.call_args.args[1]["progress_percent"], 60)
+                # 复现第 71 首：百分比消失，但媒体区仍显示“取消上传”。
+                await page.set_content('''
+                    <div class="media-status-content">
+                        <span class="ant-progress-text">75%</span>
+                        <div class="tag-inner">取消上传</div>
+                    </div>
+                    <div class="form-btns"><button class="weui-desktop-btn_disabled">发表</button></div>
+                ''')
+                waiting = asyncio.create_task(video.wait_for_upload_complete(
+                    page, timeout_seconds=5, stall_timeout_seconds=0.1))
+                await page.wait_for_timeout(50)
+                await page.locator(".ant-progress-text").evaluate("node => node.remove()")
+                with self.assertRaises(TencentUploadStalledError):
+                    await waiting
+                state = video.save_upload_diagnostic.call_args.args[1]
+                self.assertIsNone(state["progress_percent"])
+                self.assertTrue(state["upload_active"])
+                self.assertEqual(state["phase"], "transferring")
                 await page.locator(".media-status-content").evaluate("node => node.remove()")
                 with self.assertRaises(RuntimeError) as result:
                     await video.wait_for_upload_complete(page, timeout_seconds=0, stall_timeout_seconds=0.01)
